@@ -1,0 +1,21 @@
+# Secrets / local env
+.env
+*.env
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+/legacy
+/example
+/docs
+/dataset_construction/__pycache__
+/dataset_construction/cache
+/dataset_construction/sandbox
+/dataset_construction/cavir
+/dataset_construction/outputs
+/dataset_construction/task_cache
+/dataset_construction/temp_output
+/dataset_construction/code_tool.log
+/dataset_construction/test_request.ipynb
