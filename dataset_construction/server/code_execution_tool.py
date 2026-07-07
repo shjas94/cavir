@@ -8,6 +8,7 @@ import uuid
 import datetime
 import ast
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set
 from PIL import Image
@@ -364,8 +365,13 @@ class _UnifiedWorkspaceSandbox:
             os.chdir(original_cwd)
 
 
-# Global sandbox instances per task (for environment persistence)
-_task_sandboxes: Dict[str, _UnifiedWorkspaceSandbox] = {}
+# Global sandbox instances per task (for environment persistence).
+# Bounded as an LRU cache: without an eviction policy, one entry accumulates
+# per unique workspace_dir for the entire lifetime of this MCP server
+# process, which grows unboundedly across a long run (e.g. thousands of
+# dataset samples) and never frees memory.
+_MAX_SANDBOXES = int(os.getenv("MAX_TASK_SANDBOXES", "64"))
+_task_sandboxes: "OrderedDict[str, _UnifiedWorkspaceSandbox]" = OrderedDict()
 
 def _get_or_create_sandbox(
     workspace_dir: str,
@@ -377,9 +383,12 @@ def _get_or_create_sandbox(
     """
     Get the existing sandbox for the workspace or create a new one.
 
-    This function uses a global dictionary to cache sandbox instances based on
-    the workspace directory. This ensures that the same sandbox is used for
-all operations within the same task, preserving state.
+    This function uses a global LRU-bounded dictionary to cache sandbox
+    instances based on the workspace directory. This ensures that the same
+    sandbox is used for all operations within the same task, preserving
+    state, while evicting the least-recently-used entries once the cache
+    exceeds `_MAX_SANDBOXES` so memory usage doesn't grow without bound over
+    a long-running process handling many distinct workspaces.
     
     Args:
         workspace_dir: The absolute path to the workspace directory.
@@ -392,16 +401,27 @@ all operations within the same task, preserving state.
         An instance of _UnifiedWorkspaceSandbox.
     """
     global _task_sandboxes
-    if workspace_dir not in _task_sandboxes:
+    if workspace_dir in _task_sandboxes:
+        # Mark as most-recently-used.
+        _task_sandboxes.move_to_end(workspace_dir)
+        return _task_sandboxes[workspace_dir]
+
+    if verbose:
+        print(f"Creating new sandbox for workspace: {workspace_dir}")
+    _task_sandboxes[workspace_dir] = _UnifiedWorkspaceSandbox(
+        workspace_dir=workspace_dir,
+        sandbox=sandbox,
+        verbose=verbose,
+        unsafe_mode=unsafe_mode,
+        import_whitelist=import_whitelist,
+    )
+
+    # Evict least-recently-used sandboxes once over capacity.
+    while len(_task_sandboxes) > _MAX_SANDBOXES:
+        evicted_workspace_dir, _ = _task_sandboxes.popitem(last=False)
         if verbose:
-            print(f"Creating new sandbox for workspace: {workspace_dir}")
-        _task_sandboxes[workspace_dir] = _UnifiedWorkspaceSandbox(
-            workspace_dir=workspace_dir,
-            sandbox=sandbox,
-            verbose=verbose,
-            unsafe_mode=unsafe_mode,
-            import_whitelist=import_whitelist,
-        )
+            print(f"Evicting least-recently-used sandbox for workspace: {evicted_workspace_dir}")
+
     return _task_sandboxes[workspace_dir]
 
 # --------------------------------------------------------------------------- #

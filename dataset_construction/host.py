@@ -232,35 +232,44 @@ class LLMBackend:
         aggregated_reasoning = ""
         tool_call_buffers: Dict[int, Dict[str, Any]] = {}
         finish_reason = None
-        
-        async for chunk in stream:
-            choice = chunk.choices[0]
-            delta = choice.delta
 
-            if getattr(choice, "finish_reason", None):
-                finish_reason = choice.finish_reason
+        try:
+            async for chunk in stream:
+                choice = chunk.choices[0]
+                delta = choice.delta
 
-            if getattr(delta, "content", None): # content outside <thknk> block
-                aggregated_content += delta.content
-                
-            if getattr(delta, "reasoning", None): # corresponds to thinking process
-                aggregated_reasoning += delta.reasoning
-                
-            if getattr(delta, "tool_calls", None):
-                for tc in delta.tool_calls:
-                    idx = getattr(tc, "index", 0) or 0
-                    b = tool_call_buffers.setdefault(
-                        idx,
-                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
-                    )
-                    if getattr(tc, "id", None):
-                        b["id"] = tc.id
-                    func = getattr(tc, "function", None)
-                    if func is not None:
-                        if getattr(func, "name", None):
-                            b["function"]["name"] = func.name
-                        if getattr(func, "arguments", None):
-                            b["function"]["arguments"] += func.arguments
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+
+                if getattr(delta, "content", None): # content outside <thknk> block
+                    aggregated_content += delta.content
+                    
+                if getattr(delta, "reasoning", None): # corresponds to thinking process
+                    aggregated_reasoning += delta.reasoning
+                    
+                if getattr(delta, "tool_calls", None):
+                    for tc in delta.tool_calls:
+                        idx = getattr(tc, "index", 0) or 0
+                        b = tool_call_buffers.setdefault(
+                            idx,
+                            {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                        )
+                        if getattr(tc, "id", None):
+                            b["id"] = tc.id
+                        func = getattr(tc, "function", None)
+                        if func is not None:
+                            if getattr(func, "name", None):
+                                b["function"]["name"] = func.name
+                            if getattr(func, "arguments", None):
+                                b["function"]["arguments"] += func.arguments
+        finally:
+            # Explicitly release the streaming response's underlying HTTP
+            # connection/buffers instead of relying on GC to eventually call
+            # it, which can lag (especially after retried/partial streams)
+            # and let connections/memory accumulate over many requests.
+            close = getattr(stream, "close", None)
+            if close is not None:
+                await close()
 
         tool_calls = list(tool_call_buffers.values()) if tool_call_buffers else None
         content = aggregated_content.strip() if aggregated_content else None
