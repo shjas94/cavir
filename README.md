@@ -4,8 +4,6 @@
 
 CaVIR teaches a vision–language model to decide **when a tool is worth using and which tool gives the best value for its cost**, to **abstain** when it is not confident enough, and to **causally validate** that a tool call actually contributed to the answer.
 
-> See [`docs/CaVIR_Research_Proposal_v4.md`](docs/CaVIR_Research_Proposal_v4.md) for the full research proposal.
-
 ---
 
 ## Core Idea

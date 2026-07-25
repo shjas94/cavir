@@ -9,7 +9,7 @@ cd "$SCRIPT_DIR"
 
 # ---- Config (override via env or positional args) ----
 DATASET_NAME="${1:-${DATASET_NAME:-docvqa}}"
-CONCURRENCY="${CONCURRENCY:-32}"
+CONCURRENCY="${CONCURRENCY:-64}"
 SAMPLE="${2:-${SAMPLE:--1}}"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

@@ -67,14 +67,17 @@ def _preprocess_image(img_path: str) -> str:
     Returns:
         Base64 encoded string of the image
     """
-    pil_image = Image.open(img_path)
-    resized_height, resized_width = smart_resize(pil_image.height, pil_image.width, factor=256*2)
-    pil_image = pil_image.resize((resized_width, resized_height))
-    
+    # Use context managers so the opened image file handle and the in-memory
+    # PNG buffer are released deterministically instead of lingering until GC,
+    # which previously leaked file descriptors/memory across many samples.
+    with Image.open(img_path) as pil_image:
+        resized_height, resized_width = smart_resize(pil_image.height, pil_image.width, factor=14*2)
+        resized_image = pil_image.resize((resized_width, resized_height))
+
     # Convert PIL Image to base64 string
-    buffer = BytesIO()
-    pil_image.save(buffer, format="PNG")
-    image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    with BytesIO() as buffer:
+        resized_image.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return image_base64
 
 class HFDataset(Dataset):
