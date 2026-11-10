@@ -18,4 +18,26 @@ __pycache__/
 /dataset_construction/task_cache
 /dataset_construction/temp_output
 /dataset_construction/code_tool.log
+/dataset_construction/logs/
 /dataset_construction/test_request.ipynb
+# LlamaFactory is an upstream checkout with its own .git (data, saves, logs inside)
+/sft/LlamaFactory/
+/value_head/outputs/
+/benchmark_eval/outputs/
+# Agent sessions' working files, reports for the user, personal and scratch files
+/.claude/
+/reports/
+/portfolio/
+/docs_deprecated/
+/_workspace/
+# Generated data, trial runs, results, and archives of removed code kept on the server only
+/dataset_construction/outputs*/
+/dataset_construction/legacy/
+/dataset_construction/testing/
+/dataset_construction/code_snapshots/
+/sft/results/
+*.log
+*.out
+*.pid
+.ipynb_checkpoints/
+.DS_Store
