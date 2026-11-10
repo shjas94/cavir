@@ -1,77 +1,42 @@
 # CaVIR
 
-**Cost-Aware Visual Reasoning with Learned Operation Necessity, Calibrated Abstention, and Mediation-Based Validation**
+Code for a research project on how vision-language models use visual tools such as cropping and OCR while
+reasoning about an image. It covers generating tool-using training data, supervised fine-tuning, training a
+value model, and evaluation on public benchmarks.
 
-CaVIR teaches a vision–language model to decide **when a tool is worth using and which tool gives the best value for its cost**, to **abstain** when it is not confident enough, and to **causally validate** that a tool call actually contributed to the answer.
+## Layout
 
----
-
-## Core Idea
-
-Modern visual-reasoning models call tools (zoom-in, code execution, sketching) to solve hard problems, but they do not learn *whether* a given tool is actually needed. CaVIR learns a single score, **V-VON** (Value-based Visual Operation Necessity), that estimates the net benefit of a tool minus its cost, and uses it to:
-
-- **Route** — pick the tool with the highest positive V-VON, otherwise skip.
-- **Abstain** — hold back the final answer when the calibrated correctness probability is too low.
-- **Validate** — check, after training, whether tool calls causally contribute to the answer.
-
----
-
-## Roadmap
-
-CaVIR is built as a four-stage training pipeline. Only **cold-start dataset construction** is implemented so far; the remaining stages are in progress.
-
-- [x] **Cold-start dataset construction** — collect visual-reasoning traces with tool calls (see below).
-- [ ] **Stage A — Text warm-up SFT** *(in progress)*
-- [ ] **Stage B — Visual-tool SFT** *(in progress)*
-- [ ] **Stage C — Necessity-score learning (CANE-Predictor)** *(in progress)*
-- [ ] **Stage D — Reinforcement learning (Dr.GRPO + AXPO + ESPO)** *(in progress)*
-- [ ] **Evaluation & causal-mediation analysis** *(in progress)*
-
----
-
-## Cold-Start Dataset Construction
-
-The only implemented module. It runs a fixed data-generator VLM as a visual-reasoning agent over a VQA dataset, letting it reason step by step and call tools, and records the resulting traces as JSONL for downstream supervised fine-tuning.
-
-**Location:** [`dataset_construction/`](dataset_construction/)
-
-- `host.py` — agent orchestrator: drives the VLM through reasoning/tool-calling cycles via MCP.
-- `dataset.py` — dataset loading and image pre-processing.
-- `run.sh` — entry point.
-- `server/` — MCP tool servers:
-  - **Code execution** (`code_execution_tool.py`): `run_code` in a sandboxed interpreter.
-  - **Image processing** (`image_processing_tool.py`): `crop_zoomin`, `mark_dots`, `draw_bbox`, `crop_ocr_image`, `imaginate_editing`.
-
-Supported source datasets: `docvqa`, `chartqa_1`, `chartqa_2`, `infographics_vqa`.
-
-### Usage
-
-```bash
-cd dataset_construction
-./run.sh                       # defaults to the docvqa dataset
-./run.sh chartqa_1             # choose a dataset
-```
-
-Outputs (traces and intermediate tool results) are written to `dataset_construction/outputs/<dataset>_<timestamp>/`.
-
-### Configuration
-
-Set these in `dataset_construction/.env` (loaded automatically by `run.sh`):
-
-| Variable | Description |
+| Folder | Contents |
 | --- | --- |
-| `DIRECT_BASE_URL` | Base URL of the OpenAI-compatible VLM server (e.g. vLLM). |
-| `DIRECT_API_KEY` | API key for that server. |
-| `MODEL_NAME` | Data-generator model to serve as the agent. |
+| `dataset_construction/` | Tool-using rollouts from a model served with vLLM (`host.py`, MCP tool servers in `server/`) and building of the SFT data |
+| `sft/` | LLaMA-Factory configs and multi-node launchers for supervised fine-tuning, and evaluation helpers |
+| `value_head/` | Training data, training and evaluation of the value model |
+| `benchmark_eval/` | Evaluation on public benchmarks through VLMEvalKit |
+| `scripts/` | Copying code and models to the second node |
 
-`run.sh` also accepts `CONCURRENCY`, `SAMPLE`, and `OUTPUT_DIR` as environment overrides.
+## Setup
 
----
+- Python environments: a data environment (vLLM client, MCP, transformers) for `dataset_construction/`,
+  `value_head/` and `benchmark_eval/`, and a training environment with [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
+  installed from a checkout at `sft/LlamaFactory/` (not part of this repository).
+- `dataset_construction/.env`: copy `.env.example` and set the served model's URL, API key and name.
+- `cluster.env` at the repository root (two-node runs only): `NODE0_ADDR`, `NODE1_SSH`, `NODE1_HOME`,
+  `NODE1_CONTAINER`, `NET_IFNAME`. Both `.env` files are git-ignored.
+- Dataset and model paths (Hugging Face cache locations in `dataset_construction/host.py` and `dataset.py`) and the
+  default interpreter paths in the shell scripts are machine-specific; adapt them before running.
 
-## Models
+## Running
 
-| Role | Model |
-| --- | --- |
-| Policy (trained) | Qwen3.5-4B |
-| Scorer (trained) | Qwen3.5-2B |
-| Data generator (fixed) | Qwen3.6-35B-A3B |
+Data generation (from `dataset_construction/`, with the teacher served):
+
+    ./run.sh docvqa 100                      # rollouts: DATASET [SAMPLE_COUNT]; IDS_FILE=<file> restricts the samples
+    ./make_coldstart_v2.sh docvqa chartqa_1  # filter, reformat, build, quality filter, merge into LLaMA-Factory data
+
+Supervised fine-tuning (two nodes; the same command with `run_node1_fsdp.sh` on the second node):
+
+    CONFIG=../configs/qwen35_full_cavir_v2_noarith_fixtools.yaml sft/scripts/run_node0_fsdp.sh
+
+Value head: `value_head/decision_points.py`, `branch_rollout.py`, `train_scorer.py` and `evaluate_scorer.py`, each
+documented in its header.
+
+Benchmark evaluation: see `benchmark_eval/README.md`.
