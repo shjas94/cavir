@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from torch.utils.data import Dataset
 from PIL import Image
 from io import BytesIO
@@ -8,14 +9,25 @@ import math
 from typing import Tuple, Optional
 
 IMAGE_MIN_TOKEN_NUM = 4
-IMAGE_MAX_TOKEN_NUM = 1024
+# Matches the SFT image budget (LLaMA Factory image_max_pixels=262144 = 334 * 28**2),
+# so the teacher perceives images at the resolution the student is trained on.
+# Fine detail is then only recoverable through tools, which read the original file.
+IMAGE_MAX_TOKEN_NUM = 334
 MAX_RATIO = 200
-SPATIAL_MERGE_SIZE = 2
 IMAGES_DIR = {
     "docvqa": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/docvqa/images/documents",
     "chartqa_1": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/chartqa_1",
     "chartqa_2": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/chartqa_2",
-    "infographics_vqa": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-VLM-Dataset-v2/snapshots/51f4f4d219315c3283950994d4eb3d7fc30aa87b/infographicsvqa_cot/images"
+    "infographics_vqa": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-VLM-Dataset-v2/snapshots/51f4f4d219315c3283950994d4eb3d7fc30aa87b/infographicsvqa_cot/images",
+    "plotqa": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/mulberry_1",
+    "gqa_1": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/gqa_1/images",
+    "gqa_2": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/gqa_1/images",
+    "geometry3k": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-Image-Training-v3/snapshots/7656391d4d4cb11ec3722b34f10d499435de0460/geometry3k/train",
+    "geomverse_cot": "/root/.cache/huggingface/hub/datasets--nvidia--Nemotron-VLM-Dataset-v2/snapshots/51f4f4d219315c3283950994d4eb3d7fc30aa87b/geomverse_cot",
+    # v3.5 ships no images: fetch_v35_images.py writes them here under the names the annotations use
+    "hopchain_fintabnet": "/root/.cache/huggingface/v35_images/hopchain_fintabnet",
+    "chartnet_qa_01_difficulty": "/root/.cache/huggingface/v35_images/chartnet_qa_01_difficulty",
+    "coco_count_spatial_qa": "/root/.cache/huggingface/v35_images/coco_count_spatial_qa",
 }
 
 
@@ -69,7 +81,7 @@ def _preprocess_image(img_path: str) -> str:
     """
     # Use context managers so the opened image file handle and the in-memory
     # PNG buffer are released deterministically instead of lingering until GC,
-    # which previously leaked file descriptors/memory across many samples.
+    # which would leak file descriptors/memory across many samples.
     with Image.open(img_path) as pil_image:
         resized_height, resized_width = smart_resize(pil_image.height, pil_image.width, factor=14*2)
         resized_image = pil_image.resize((resized_width, resized_height))
@@ -97,14 +109,20 @@ class HFDataset(Dataset):
     def __len__(self):
         return len(self._offsets)
 
-    def _load_data(self):
-        pass
+    def item_ids(self) -> list[str]:
+        """Ids in index order, by the same rule as __getitem__, without decoding any image."""
+        with open(self.jsonl_path, 'rb') as f:
+            items = [json.loads(line) for line in f if line.strip()]
+        return [item.get('id', self.dataset_name + "_" + str(idx)) for idx, item in enumerate(items)]
 
     def __getitem__(self, idx):
         with open(self.jsonl_path, 'rb') as f:
             f.seek(self._offsets[idx])
             item = json.loads(f.readline())
-        item_id = item['id']
+        if 'id' in item.keys():
+            item_id = item['id']
+        else:
+            item_id = self.dataset_name + "_" + str(idx)
         if self.dataset_name == "docvqa":
             question = item['messages'][0]['content'][0]
             image_path = os.path.join(IMAGES_DIR[self.dataset_name], item['messages'][0]['content'][1]['image'])
@@ -118,8 +136,44 @@ class HFDataset(Dataset):
         elif self.dataset_name == "infographics_vqa":
             question = item['messages'][0]['content'][1]['text'].strip('\n')
             image_path = os.path.join(IMAGES_DIR[self.dataset_name], item['messages'][0]['content'][0]['image'])
-            gt = item['messages'][1]['content'][0]['text'].strip('\n')
+            gt = item['messages'][1]['content'][0]['text']
             
+        elif self.dataset_name == "plotqa":
+            question = item['messages'][0]['content'][1].strip('\n').split('\n')[0]
+            image_path = os.path.join(IMAGES_DIR[self.dataset_name], item['messages'][0]['content'][0]['image'])
+            gt = item['messages'][1]['content'][0]
+        
+        elif self.dataset_name == "gqa_1" or self.dataset_name == "gqa_2":
+            question = item['messages'][0]['content'][1].split('\n')[1]
+            image_path = os.path.join(IMAGES_DIR[self.dataset_name], item['messages'][0]['content'][0]['image'])
+            gt = item['messages'][1]['content'][0]
+        
+        elif self.dataset_name == "geometry3k":
+            geometry3k_postfix = '\nDo not explain your answer but write only the answer label (A, B, ...) in this format:\n\nAnswer: \\boxed{...}.'
+            question = item['messages'][0]['content'][1].strip('\n').replace(geometry3k_postfix, '')
+            image_path = os.path.join(IMAGES_DIR[self.dataset_name], item['messages'][0]['content'][0]['image'])
+            gt = item['messages'][1]['content'][0]
+        
+        # TODO
+        elif self.dataset_name == "geomverse_cot":
+            question, image_name = "", ""
+            for message in item['messages'][0]['content']:
+                if message["type"] == "text":
+                    question = message["text"]
+                elif message["type"] == "image":
+                    image_name = message["image"]
+            question = "\n".join(message["text"].strip('\n').split("\n")[:-1])
+            image_path = os.path.join(IMAGES_DIR[self.dataset_name], image_name)
+            gt = item['messages'][1]['content'][0]['text']
+            
+        elif self.dataset_name in ("hopchain_fintabnet", "chartnet_qa_01_difficulty", "coco_count_spatial_qa"):
+            question = item['messages'][0]['content'][1].strip('\n')
+            image_path = os.path.join(IMAGES_DIR[self.dataset_name], item['messages'][0]['content'][0]['image'])
+            gt = item['messages'][1]['content'][0]
+            if self.dataset_name == "coco_count_spatial_qa":
+                # "(B)" -> "B": the option letter, as geometry3k's ground truths are written (the teacher boxes the letter)
+                gt = re.sub(r"\(([A-Z])\)\s*$", r"\1", gt)
+
         else:
             raise NotImplementedError(f"dataset_name {self.dataset_name} is not supported yet.")  
         

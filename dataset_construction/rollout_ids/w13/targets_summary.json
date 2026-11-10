@@ -1,0 +1,75 @@
+{
+ "docvqa": {
+  "records": 35759,
+  "excluded": 170,
+  "repeat_pairs": 2,
+  "pool": 35587,
+  "generate": 5000
+ },
+ "infographics_vqa": {
+  "records": 19548,
+  "excluded": 170,
+  "repeat_pairs": 1,
+  "pool": 19377,
+  "generate": 5000
+ },
+ "geomverse_cot": {
+  "records": 9295,
+  "excluded": 170,
+  "repeat_pairs": 0,
+  "pool": 9125,
+  "generate": 5000
+ },
+ "gqa_1": {
+  "records": 21094,
+  "excluded": 338,
+  "repeat_pairs": 2,
+  "pool": 20754,
+  "generate": 10000
+ },
+ "chartqa_1": {
+  "records": 21853,
+  "excluded": 385,
+  "repeat_pairs": 1731,
+  "pool": 19737,
+  "generate": 10000
+ },
+ "plotqa": {
+  "records": 292,
+  "excluded": 172,
+  "repeat_pairs": 1,
+  "pool": 119,
+  "generate": 119
+ },
+ "geometry3k": {
+  "records": 2078,
+  "excluded": 170,
+  "repeat_pairs": 0,
+  "pool": 1908,
+  "generate": 1908
+ },
+ "hopchain_fintabnet": {
+  "records": 56479,
+  "repeat_pairs": 0,
+  "pool": 56479,
+  "held_out": 135,
+  "generate": 5000,
+  "generate_same_image_as_held_out": 43
+ },
+ "chartnet_qa_01_difficulty": {
+  "records": 9498,
+  "repeat_pairs": 0,
+  "pool": 9498,
+  "held_out": 135,
+  "generate": 5000,
+  "generate_same_image_as_held_out": 0
+ },
+ "coco_count_spatial_qa": {
+  "records": 14777,
+  "repeat_pairs": 0,
+  "pool": 14777,
+  "held_out": 135,
+  "generate": 5000,
+  "generate_same_image_as_held_out": 13
+ }
+}

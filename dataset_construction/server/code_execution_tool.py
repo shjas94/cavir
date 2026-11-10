@@ -1,39 +1,36 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import uuid
 import datetime
 import ast
+import base64
 import re
+import shlex
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set
-from PIL import Image
-from io import BytesIO
-from mcp.server.fastmcp import FastMCP
+from typing import Annotated, Dict, List, Optional, Set
+import mcp.types as mcp_types
+from mcp.server.mcpserver import MCPServer
+from pydantic import Field
 from interpreters.subprocess_interpreter import SubprocessInterpreter
 
 # --------------------------------------------------------------------------- #
 #  Default import whitelist configuration
 # --------------------------------------------------------------------------- #
 
-DEFAULT_IMPORT_WHITELIST = [
-    # Standard library
-    'math', 'random', 're', 'collections', 'itertools', 'functools', 'operator',
-    'typing', 'base64', 'logging', 'warnings',
-    
-    # Data science core libraries
-    'numpy', 'pandas', 'pd', 'matplotlib', 'seaborn',
-    'scipy', 'sklearn', 'plotly', 'dash'
-    
-    # Image processing
-    'PIL', 'cv2', 'skimage', 'imageio',
+# `math_compute` is a pure numeric calculator. Every input number must already
+# be a literal in the generated source.
+MATH_IMPORT_WHITELIST = [
+    'math', 'statistics', 'decimal', 'fractions', 'numpy', 'scipy', 'sympy', 'pandas', 'collections'
+]
 
-    # Other common tools
-    'tqdm'
+# `visualize_data` accepts the same numeric helpers plus matplotlib. No image,
+# filesystem, network, or serialization modules are exposed.
+VISUALIZATION_IMPORT_WHITELIST = [
+    *MATH_IMPORT_WHITELIST, 'matplotlib', 'mpl_toolkits'
 ]
 
 # --------------------------------------------------------------------------- #
@@ -87,20 +84,17 @@ def _extract_imports_from_code(code: str) -> Set[str]:
     return imports
 
 
-def _validate_imports(code: str, whitelist: Optional[List[str]] = None) -> tuple[bool, List[str], List[str]]:
+def _validate_imports(code: str, whitelist: List[str]) -> tuple[bool, List[str], List[str]]:
     """
     Validate that all imports in code are in the whitelist.
     
     Args:
         code: Python source code to validate
-        whitelist: List of allowed module names (defaults to DEFAULT_IMPORT_WHITELIST)
+        whitelist: List of allowed module names
         
     Returns:
         Tuple of (is_valid, allowed_imports, forbidden_imports)
     """
-    if whitelist is None:
-        whitelist = DEFAULT_IMPORT_WHITELIST
-    
     whitelist_set = set(whitelist)
     imports = _extract_imports_from_code(code)
     
@@ -120,21 +114,63 @@ def _validate_imports(code: str, whitelist: Optional[List[str]] = None) -> tuple
 #  Logger setup
 # --------------------------------------------------------------------------- #
 
+# Absolute so the log lands in dataset_construction/logs (an output folder, not the code folder) whatever CWD the
+# host spawned this stdio server from.
+CODE_TOOL_LOG = os.getenv("CODE_TOOL_LOG", str(Path(__file__).resolve().parents[1] / "logs" / "code_tool.log"))
+Path(CODE_TOOL_LOG).parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('code_tool.log'),
+        logging.FileHandler(CODE_TOOL_LOG),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-#  FastMCP server instance
+#  MCP server instance
 # --------------------------------------------------------------------------- #
 
-mcp = FastMCP("code_exec")
+mcp = MCPServer("code_exec")
+
+ScriptFilename = Annotated[
+    str,
+    Field(
+        min_length=1,
+        description=(
+            "Descriptive basename for the generated Python script, for example "
+            "'percentage_change.py'. Paths are stripped and collisions are auto-renamed."
+        ),
+    ),
+]
+MathSource = Annotated[
+    str,
+    Field(
+        min_length=1,
+        description=(
+            "Self-contained Python source for a multi-step calculation. Put every "
+            "observed input value directly in the code as a literal and print the result. "
+            "Do not read files, images, arguments, interactive input, or network data."
+        ),
+    ),
+]
+VisualizationSource = Annotated[
+    str,
+    Field(
+        min_length=1,
+        description=(
+            "Self-contained matplotlib.pyplot source using only observed literal values. "
+            "Create exactly one figure; do not call savefig(), close(), open(), input(), "
+            "or access files, images, arguments, or the network."
+        ),
+    ),
+]
+TaskCacheDirectory = Annotated[
+    str | None,
+    Field(description="Host-injected task workspace. Never provide this argument."),
+]
 
 # --------------------------------------------------------------------------- #
 #  Simplified workspace management
@@ -193,120 +229,32 @@ def _log_execution(operation: str, details: dict, workspace_dir: str) -> None:
 # --------------------------------------------------------------------------- #
 
 class _UnifiedWorkspaceSandbox:
-    """
-    Unified sandbox with flat workspace structure and import whitelist validation.
-    
-    🎯 KEY FEATURES:
-        • All files in single workspace directory
-        • Persistent environment across executions
-        • Terminal command support
-        • File overwrite behavior (no versioning)
-        • Import whitelist validation for security
-    
-    🔒 IMPORT SECURITY:
-        • Validates all import statements against whitelist
-        • Supports torch, transformers, and other ML libraries
-        • Blocks unauthorized imports for security
+    """One task's flat workspace: runs terminal commands in a subprocess whose cwd is the workspace.
+
+    Generated source is checked against the import whitelist before it reaches here (``_validate_imports``).
     """
 
     def __init__(
         self,
         workspace_dir: str,
-        sandbox: Literal[
-            "internal_python"
-        ] = "subprocess",
         *,
         verbose: bool = False,
-        unsafe_mode: bool = False,
-        import_whitelist: Optional[list[str]] = None,
-        require_confirm: bool = False,
     ) -> None:
         self.workspace_dir = workspace_dir
         self.verbose = verbose
-        
-        # Set up import whitelist
-        self.import_whitelist = import_whitelist or DEFAULT_IMPORT_WHITELIST.copy()
-        self.unsafe_mode = unsafe_mode  # If True, skip whitelist validation
-        self.require_confirm = require_confirm
 
         # Initialize the interpreter, ensuring it uses the correct workspace directory
-        self.interpreter = self._initialize_interpreter(sandbox, self.workspace_dir)
+        self.interpreter = self._initialize_interpreter(self.workspace_dir)
 
-    def _initialize_interpreter(self, sandbox_type: str, work_dir: str):
+    def _initialize_interpreter(self, work_dir: str):
         """Initializes the correct interpreter."""
         
         # Default to SubprocessInterpreter
         return SubprocessInterpreter(
-            require_confirm=self.require_confirm,
             print_stdout=self.verbose,
             print_stderr=self.verbose,
             workspace_dir=work_dir,
         )
-
-    def execute_code(self, code: str, filename: str) -> str:
-        """
-        Execute Python code with import whitelist validation and save to specified filename.
-        
-        🔧 EXECUTION PROCESS:
-            1. Validate imports against whitelist
-            2. Change to workspace directory
-            3. Write code to specified filename (OVERWRITES existing)
-            4. Execute code in persistent environment
-            5. Return execution result with validation info
-        
-        🔒 WHITELIST VALIDATION:
-            • Checks all import statements in code
-            • Allows: torch, transformers, numpy, pandas, matplotlib, etc.
-            • Blocks: unauthorized system modules, network libraries not in whitelist
-        
-        Args:
-            code: Python code to execute
-            filename: Target filename (REQUIRED, will overwrite if exists)
-            
-        Returns:
-            str: Execution output with import validation results and any error messages
-        """
-        # Ensure workspace directory exists
-        Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
-        
-        original_cwd = os.getcwd()
-        os.chdir(self.workspace_dir)
-        
-        try:
-            # Validate imports if not in unsafe mode
-            validation_result = ""
-            if not self.unsafe_mode:
-                is_valid, allowed_imports, forbidden_imports = _validate_imports(code, self.import_whitelist)
-                
-                if not is_valid:
-                    error_msg = f"❌ IMPORT VALIDATION FAILED\n"
-                    error_msg += f"Forbidden imports: {', '.join(forbidden_imports)}\n"
-                    error_msg += f"Allowed imports in whitelist:\n"
-                    for item in sorted(self.import_whitelist):
-                        error_msg += f"  • {item}\n"
-                    error_msg += f"\n💡 Contact admin to add other packages to whitelist."
-                    return error_msg
-                
-                if allowed_imports:
-                    validation_result = f"✅ IMPORTS VALIDATED: {', '.join(sorted(allowed_imports))}\n"
-                    validation_result += f"🔒 Whitelist contains: {len(self.import_whitelist)} approved modules\n"
-                    validation_result += "=" * 50 + "\n"
-            
-            # Write code to file (OVERWRITE if exists)
-            code_file = Path(self.workspace_dir) / filename
-            file_existed = code_file.exists()
-            code_file.write_text(code, encoding="utf-8")
-            logger.info(f"Code written to: {filename} ({'OVERWRITTEN' if file_existed else 'CREATED'})")
-            
-            # Execute the code
-            execution_result = self.interpreter.run(code, code_type="python")
-            
-            # Combine validation and execution results
-            full_result = validation_result + execution_result
-            return full_result
-            
-        finally:
-            os.chdir(original_cwd)
 
     def execute_terminal_command(self, command: str) -> str:
         """
@@ -321,18 +269,12 @@ class _UnifiedWorkspaceSandbox:
         if self.verbose:
             print(f"Executing terminal command: {command} in {self.workspace_dir}")
 
-        log_details = {"command": command}
-        _log_execution("execute_terminal_command", log_details, self.workspace_dir)
-        
-        # Ensure workspace directory exists before attempting to change to it
         Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
-        
-        original_cwd = os.getcwd()
-        os.chdir(self.workspace_dir)
-        
+
+        # The interpreter already runs the subprocess with cwd=workspace_dir, so
+        # this must NOT chdir: the CWD is process-global and this server handles
+        # many tasks concurrently.
         try:
-            # The interpreter is already configured with the correct working directory.
-            # We pass 'bash' to indicate it's a shell command.
             result = self.interpreter.run(command, code_type="bash")
 
             # Process result based on its type
@@ -348,21 +290,31 @@ class _UnifiedWorkspaceSandbox:
                     status = "✅ Command executed successfully."
                 else:
                     status = f"⚠️ Command finished with non-zero exit code: {exit_code}."
-                
-                return f"{status}\n\nSTDOUT/STDERR:\n{''.join(output_lines)}"
+
+                output = f"{status}\n\nSTDOUT/STDERR:\n{''.join(output_lines)}"
 
             # Handle simple string output for older interpreter versions
             elif isinstance(result, str):
-                return f"✅ Command executed.\n\nOutput:\n{result}"
-            
+                # The interpreter folds the exit status into the text, so the
+                # status header must be derived from it: labelling every string
+                # result as a success hides failing scripts from the caller.
+                failure = _detect_execution_error(result)
+                status = f"⚠️ Command failed: {failure}." if failure else "✅ Command executed."
+                output = f"{status}\n\nOutput:\n{result}"
+
             # Handle other potential result formats
             else:
-                return f"✅ Command executed.\n\nResult:\n{str(result)}"
+                output = f"✅ Command executed.\n\nResult:\n{str(result)}"
 
         except Exception as e:
-            return f"❌ Error executing terminal command: {str(e)}"
-        finally:
-            os.chdir(original_cwd)
+            output = f"❌ Error executing terminal command: {str(e)}"
+
+        _log_execution(
+            "execute_terminal_command",
+            {"command": command, "output": output},
+            self.workspace_dir,
+        )
+        return output
 
 
 # Global sandbox instances per task (for environment persistence).
@@ -375,10 +327,7 @@ _task_sandboxes: "OrderedDict[str, _UnifiedWorkspaceSandbox]" = OrderedDict()
 
 def _get_or_create_sandbox(
     workspace_dir: str,
-    sandbox: str,
     verbose: bool,
-    unsafe_mode: bool,
-    import_whitelist: Optional[List[str]] = None
 ) -> _UnifiedWorkspaceSandbox:
     """
     Get the existing sandbox for the workspace or create a new one.
@@ -392,10 +341,7 @@ def _get_or_create_sandbox(
     
     Args:
         workspace_dir: The absolute path to the workspace directory.
-        sandbox: The type of sandbox to create.
         verbose: Whether to enable verbose logging.
-        unsafe_mode: Whether to disable security checks (e.g., import validation).
-        import_whitelist: A list of allowed Python modules.
         
     Returns:
         An instance of _UnifiedWorkspaceSandbox.
@@ -410,10 +356,7 @@ def _get_or_create_sandbox(
         print(f"Creating new sandbox for workspace: {workspace_dir}")
     _task_sandboxes[workspace_dir] = _UnifiedWorkspaceSandbox(
         workspace_dir=workspace_dir,
-        sandbox=sandbox,
         verbose=verbose,
-        unsafe_mode=unsafe_mode,
-        import_whitelist=import_whitelist,
     )
 
     # Evict least-recently-used sandboxes once over capacity.
@@ -461,167 +404,554 @@ def _normalize_filename(filename: str) -> str:
         
     return filename
 
-@mcp.tool()
-async def run_code(
-    filename: str,
-    content: str,
-    task_cache_dir: str | None = None,
-    verbose: bool = False,
-) -> Dict[str, str]:
+
+# The interpreter never raises on a failing script: it reports the failure
+# inside the returned text only, so these markers are the single source of
+# truth for whether the executed code actually succeeded.
+_EXIT_CODE_RE = re.compile(r"\(Execution failed with return code (-?\d+)\)")
+_NONZERO_EXIT_RE = re.compile(r"Command finished with non-zero exit code:\s*(-?\d+)")
+_TIMEOUT_RE = re.compile(r"Process timed out after \d+ seconds")
+
+
+def _detect_execution_error(execution_result: str) -> str:
     """
-    Write Python code to a `.py` file in the workspace and execute it.
-    Use this tool when you want to calculate numerical values (calculate average, sum, min, or other complex calculations) or visualize data (drawing charts, plots) by writing and executing Python code.
-    
-    WARNING WITH IMAGE RESULT:
-        When the result of code is images like charts or plots, please save the images to png files in the '/workspace/cavir/dataset_construction/temp_output' and return the full file path in the execution result. 
-        The files created here will be visible to subsequent operations, so they can be accessed or manipulated by other tools as needed.
-        Format of the result image must be PNG. You can use libraries like matplotlib, seaborn, or plotly to create and save the images. For example:
-    
-    Workflow Note: This is a one-shot write-and-execute tool. The code is saved
-    as a `.py` file in the workspace and immediately run via
-    `python {final_filename}` inside the persistent sandbox. To save code
-    without executing it, use `write_workspace_file`. To run an existing
-    script, use `execute_terminal_command`.
+    Classify a sandbox execution result as failed or succeeded.
 
-    🔧 EXECUTION PROCESS:
-        1. Sanitize `filename` (strip path components, whitespace, quotes).
-        2. Ensure the file ends with `.py` — any other extension is coerced
-           (e.g. `solve_q1` → `solve_q1.py`, `foo.txt` → `foo.py`).
-        3. Resolve filename collisions WITHOUT overwriting: if `{stem}.py`
-           already exists, try `{stem}_1.py`, `{stem}_2.py`, … until an
-           unused name is found. The chosen name is `final_filename`.
-        4. Write `content` to `final_filename` in the workspace.
-        5. Execute `python {final_filename}` in the persistent sandbox
-           (same workspace as the other workspace tools).
-        6. Return both the file-write log and the execution result.
-
-    📝 INPUT:
-        • filename: Base name for the script. Path components are stripped
-          for safety; `.py` is appended if missing.
-        • content: Python source code to write and execute (REQUIRED).
-        • task_cache_dir: Task cache directory path (auto-injected).
-        • verbose: Include detailed sandbox execution information.
-
-    📤 OUTPUT:
-        Returns a dict with two keys:
-        • `file_write_log` (str):
-            - On success: confirmation containing `final_filename`,
-              workspace path, and content size.
-            - On filename / write failure: an `❌ ...` error message.
-        • `execution_result` (str):
-            - On success: STDOUT / STDERR and exit-code status from
-              `python {final_filename}`.
-            - If the file write failed: empty string (no execution attempted).
-
-    🔒 CONSTRAINTS:
-        • Only `.py` files are produced; non-`.py` extensions are coerced.
-        • NEVER overwrites existing files — auto-renames with `_1`, `_2`, …
-        • Directory traversal in `filename` is stripped (basename only).
-        • Runs in the same persistent workspace as the other tools, so any
-          files created or state established here are visible to subsequent
-          operations.
-    
     Args:
-        filename: Base name for the script (`.py` is added if missing)
-        content: Python code to write into the file and execute
-        task_cache_dir: Task cache directory path
-        verbose: Whether to include verbose execution details
+        execution_result: Raw or status-wrapped output of a sandbox run.
 
     Returns:
-        Dict[str, str] with keys `file_write_log` and
-        `execution_result`. On write failure, `execution_result` is `""`.
-
-    Example Usage:
-        run_code("solve_q1", "print(2 + 2)")
-        # → writes solve_q1.py (or solve_q1_1.py if solve_q1.py already exists)
-        #   and executes it, returning:
-        #   {
-        #       "file_write_log": "✅ File CREATED: solve_q1.py\\n📁 Workspace: ...\\n📊 Size: 13 characters",
-        #       "execution_result": "✅ Command executed successfully.\\n\\nSTDOUT/STDERR:\\n4\\n",
-        #   }
+        A short human-readable failure description, or `""` when the run
+        finished successfully.
     """
-    workspace_dir = _get_workspace_dir(task_cache_dir)
-    try:
-        normalized_filename = _normalize_filename(filename)
-    except ValueError as e:
-        return {"file_write_log": f"❌ Filename error: {e}", "execution_result": ""}
+    if not execution_result:
+        return ""
 
-    # Ensure .py extension (per tool contract)
-    base_path = Path(normalized_filename)
+    if _TIMEOUT_RE.search(execution_result):
+        return "execution timed out"
+
+    match = _EXIT_CODE_RE.search(execution_result) or _NONZERO_EXIT_RE.search(execution_result)
+    if match:
+        return f"execution failed with return code {match.group(1)}"
+
+    stripped = execution_result.lstrip()
+    if stripped.startswith("❌"):
+        first_line = stripped.splitlines()[0].lstrip("❌").strip()
+        return first_line or "execution failed"
+
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+#  Generated-script contract
+# --------------------------------------------------------------------------- #
+# Both tools are transformations over values already observed by the model.
+# Generated source may not acquire new information from files, arguments,
+# images, the network, or interactive input.
+_FORBIDDEN_CALLS = {
+    "input": "input()",
+    "open": "open()",
+    "eval": "eval()",
+    "exec": "exec()",
+    "compile": "compile()",
+    "__import__": "__import__()",
+}
+_FORBIDDEN_ATTRIBUTE_CALLS = {
+    # Common numeric/data-library file readers.
+    "load": "file loading",
+    "loadtxt": "file loading",
+    "genfromtxt": "file loading",
+    "fromfile": "file loading",
+    "memmap": "file loading",
+    "read_csv": "file reading",
+    "read_excel": "file reading",
+    "read_feather": "file reading",
+    "read_gbq": "network data reading",
+    "read_hdf": "file reading",
+    "read_json": "file reading",
+    "read_orc": "file reading",
+    "read_pickle": "file reading",
+    "read_parquet": "file reading",
+    "read_sas": "file reading",
+    "read_spss": "file reading",
+    "read_sql": "database or network data reading",
+    "read_sql_query": "database or network data reading",
+    "read_sql_table": "database or network data reading",
+    "read_stata": "file reading",
+    "read_table": "file reading",
+    "read_fwf": "file reading",
+    "read_html": "external data reading",
+    "read_xml": "file reading",
+    "read_clipboard": "external data reading",
+    "read": "file reading",
+    "imread": "image reading",
+    "loadmat": "file loading",
+    # The visualization tool owns its one output file. Model-generated source
+    # must not write arbitrary additional artifacts.
+    "save": "file writing",
+    "savefig": "file writing",
+    "savemat": "file writing",
+    "imsave": "file writing",
+    "savetxt": "file writing",
+    "write": "file writing",
+    "to_csv": "file writing",
+    "to_excel": "file writing",
+    "to_json": "file writing",
+    "to_pickle": "file writing",
+    "to_parquet": "file writing",
+}
+
+# A single arithmetic step is cheap enough to do in the reasoning, so `math_compute`
+# is reserved for computations with several steps or an aggregation.
+# Only these four operations count as one plain step. Power, floor-division and
+# modulo remain valid math_compute work.
+_ARITHMETIC_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Div)
+# Calls that merely format/pass through a value instead of computing something.
+_PASSTHROUGH_CALLS = {"print", "round", "float", "int", "abs"}
+# Nodes that prove the script does more than one plain arithmetic step.
+_MULTI_STEP_NODES = (
+    ast.For, ast.While, ast.comprehension, ast.Lambda, ast.FunctionDef,
+    ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.IfExp, ast.Compare, ast.BoolOp,
+)
+
+
+def _is_trivial_script(code: str) -> bool:
+    """
+    Detect scripts that compute nothing (bare `pass`, or printing only literals).
+
+    These are the "meaningless" code-tool calls we want to reject before paying
+    for a sandbox round-trip: the model already knows the printed constant, so
+    running it adds no information to the trajectory.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if isinstance(node, ast.Expr):
+            value = node.value
+            if isinstance(value, ast.Constant):  # docstring / bare literal
+                continue
+            is_constant_print = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "print"
+                and all(isinstance(arg, ast.Constant) for arg in value.args)
+            )
+            if is_constant_print:
+                continue
+        return False
+    return True
+
+
+def _is_single_step_arithmetic(code: str) -> bool:
+    """
+    Detect scripts whose whole computation is one plain arithmetic step.
+
+    Such a step belongs in the model's own reasoning, not in a sandbox
+    round-trip. Anything richer — several chained operations, an aggregation (`sum`, `max`, ...), a
+    loop, a comparison or a library call — is genuinely `math_compute` territory.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+
+    operations = 0
+    for node in ast.walk(tree):
+        if isinstance(node, _MULTI_STEP_NODES):
+            return False
+        if isinstance(node, ast.Call):
+            # Any real function/method call (sum, np.mean, math.sqrt, ...) is
+            # more than one plain step.
+            if not (isinstance(node.func, ast.Name) and node.func.id in _PASSTHROUGH_CALLS):
+                return False
+        elif isinstance(node, ast.BinOp):
+            if not isinstance(node.op, _ARITHMETIC_OPS):
+                return False
+            operations += 1
+
+    return operations <= 1
+
+
+def _call_name(call: ast.Call) -> str | None:
+    """Return the final identifier of a direct or attribute call."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _validate_common_script(
+    code: str, import_whitelist: List[str]
+) -> tuple[ast.Module | None, str]:
+    """
+    Enforce the self-contained source contract shared by both tools.
+
+    Args:
+        code: Python source the model produced.
+        import_whitelist: Complete set of modules allowed for this tool.
+
+    Returns:
+        Parsed syntax tree plus an empty error, or ``None`` plus an actionable
+        rejection message.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return None, f"❌ INVALID PYTHON: {exc.msg} at line {exc.lineno}."
+
+    if _is_trivial_script(code):
+        return None, (
+            "❌ NO-OP CODE REJECTED: the script only prints constants or does nothing.\n"
+            "💡 Use the tool only to calculate from or visualize numeric values "
+            "already observed in the question or image."
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "__file__":
+            return None, (
+                "❌ EXTERNAL INPUT NOT ALLOWED: the code uses __file__.\n"
+                "💡 Put every numeric input directly in the source as a literal."
+            )
+        if isinstance(node, ast.Attribute) and node.attr == "argv":
+            return None, (
+                "❌ EXTERNAL INPUT NOT ALLOWED: the code uses sys.argv.\n"
+                "💡 Put every numeric input directly in the source as a literal."
+            )
+        if not isinstance(node, ast.Call):
+            continue
+        call_name = _call_name(node)
+        if call_name in _FORBIDDEN_CALLS:
+            return None, (
+                f"❌ EXTERNAL INPUT NOT ALLOWED: the code uses {_FORBIDDEN_CALLS[call_name]}.\n"
+                "The script receives no arguments, files, images, network data, or interactive input.\n"
+                "💡 Put every numeric input directly in the source as a literal."
+            )
+        if call_name in _FORBIDDEN_ATTRIBUTE_CALLS:
+            return None, (
+                f"❌ EXTERNAL ACCESS NOT ALLOWED: `{call_name}()` performs "
+                f"{_FORBIDDEN_ATTRIBUTE_CALLS[call_name]}.\n"
+                "💡 Use only numeric literals already observed. The tool manages its "
+                "own script."
+            )
+
+    is_valid, _, forbidden_imports = _validate_imports(code, import_whitelist)
+    if not is_valid:
+        return None, (
+            f"❌ FORBIDDEN IMPORT: {', '.join(sorted(forbidden_imports))}.\n"
+            f"Allowed modules: {', '.join(sorted(import_whitelist))}.\n"
+            "💡 Filesystem, network, image-loading and process modules are unavailable."
+        )
+
+    return tree, ""
+
+
+def _validate_math_script(code: str) -> str:
+    """Validate a self-contained, multi-step numeric computation."""
+    tree, error = _validate_common_script(code, MATH_IMPORT_WHITELIST)
+    if error:
+        return error
+    assert tree is not None
+
+    if not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "print"
+        for node in ast.walk(tree)
+    ):
+        return (
+            "❌ RESULT NOT PRINTED: math_compute returns the script's stdout.\n"
+            "💡 Print every result needed to answer the question, e.g. "
+            "`print(round(result, 2))`."
+        )
+
+    if _is_single_step_arithmetic(code):
+        return (
+            "❌ SINGLE-STEP CALCULATION REJECTED: the script performs at most one "
+            "arithmetic operation.\n"
+            "💡 Do a single add, subtract, multiply, divide or round directly in your reasoning. "
+            "Use math_compute only when the calculation needs several chained steps or an "
+            "aggregation over many numbers (sum/mean/min/max, sorting, a loop)."
+        )
+
+    return ""
+
+
+_PLOT_CALLS = {
+    "plot", "scatter", "bar", "barh", "hist", "pie", "stem", "step",
+    "fill", "fill_between", "stackplot", "errorbar", "boxplot", "violinplot",
+    "contour", "contourf", "pcolormesh", "imshow", "quiver", "plot_surface",
+    "plot_wireframe", "add_patch", "add_artist", "annotate", "text",
+}
+
+
+def _imports_matplotlib_pyplot(tree: ast.Module) -> bool:
+    """Whether source explicitly imports pyplot through a supported form."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name == "matplotlib.pyplot" for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom) and (
+            node.module == "matplotlib.pyplot"
+            or (
+                node.module == "matplotlib"
+                and any(alias.name == "pyplot" for alias in node.names)
+            )
+        ):
+            return True
+    return False
+
+
+def _validate_visualization_script(code: str) -> str:
+    """Validate code that creates one matplotlib visualization from literals."""
+    tree, error = _validate_common_script(code, VISUALIZATION_IMPORT_WHITELIST)
+    if error:
+        return error
+    assert tree is not None
+
+    if not _imports_matplotlib_pyplot(tree):
+        return (
+            "❌ MATPLOTLIB PYPLOT REQUIRED: visualize_data saves pyplot's current figure.\n"
+            "💡 Import `matplotlib.pyplot as plt`, create the plot from literal "
+            "values, and do not call savefig(); the tool saves it automatically."
+        )
+
+    calls = {
+        name for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and (name := _call_name(node))
+    }
+    if not calls.intersection(_PLOT_CALLS):
+        return (
+            "❌ NO VISUALIZATION CREATED: no matplotlib plotting call was found.\n"
+            "💡 Create a plot with plot(), scatter(), bar(), hist(), add_patch(), "
+            "or another matplotlib drawing method."
+        )
+    if "close" in calls:
+        return (
+            "❌ FIGURE CLOSED BEFORE RETURN: do not call close().\n"
+            "💡 Leave the figure open; visualize_data saves and closes it after "
+            "your code finishes."
+        )
+    return ""
+
+
+def _allocate_artifact_paths(
+    workspace_dir: str, filename: str, include_plot: bool
+) -> tuple[Path, Path | None]:
+    """Allocate non-conflicting script and optional plot paths."""
+    normalized = _normalize_filename(filename)
+    base_path = Path(normalized)
     if base_path.suffix.lower() != ".py":
         base_path = base_path.with_suffix(".py")
 
-    stem = base_path.stem            # e.g. "solve_q1"
-    suffix = base_path.suffix        # ".py"
+    stem = base_path.stem
+    candidate_stem = stem
+    index = 0
+    while True:
+        script_path = Path(workspace_dir) / f"{candidate_stem}.py"
+        plot_path = (
+            Path(workspace_dir) / f"{candidate_stem}_plot.png"
+            if include_plot else None
+        )
+        if not script_path.exists() and (plot_path is None or not plot_path.exists()):
+            return script_path, plot_path
+        index += 1
+        candidate_stem = f"{stem}_{index}"
 
-    # Find a non-conflicting filename: {stem}.py, {stem}_1.py, {stem}_2.py, ...
-    file_path = Path(workspace_dir) / base_path
-    n = 1
-    while file_path.exists():
-        file_path = Path(workspace_dir) / f"{stem}_{n}{suffix}"
-        n += 1
 
-    final_filename = file_path.name
-    file_existed = False  # by construction, we never overwrite now
+def _execution_failure(error: str) -> Dict[str, str]:
+    """Standard payload for a script rejected before execution."""
+    return {
+        "file_write_log": error,
+        "execution_result": "",
+        "execution_error": error.splitlines()[0].lstrip("❌").strip(),
+        "script_path": "",
+    }
+
+
+def _write_and_execute(
+    tool_name: str,
+    filename: str,
+    source: str,
+    task_cache_dir: str | None,
+    verbose: bool,
+    *,
+    plot: bool = False,
+) -> tuple[Dict[str, str], bytes | None]:
+    """Write a unique script, execute it, and optionally collect its PNG."""
+    workspace_dir = _get_workspace_dir(task_cache_dir)
+    try:
+        script_path, plot_path = _allocate_artifact_paths(
+            workspace_dir, filename, include_plot=plot
+        )
+    except ValueError as e:
+        return _execution_failure(f"❌ Filename error: {e}"), None
+
+    executable_source = source
+    if plot:
+        assert plot_path is not None
+        executable_source = (
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n"
+            f"{source.rstrip()}\n\n"
+            "# Added by visualize_data: persist the current figure.\n"
+            "import matplotlib.pyplot as _cavir_plt\n"
+            f"_cavir_plt.gcf().savefig({plot_path.name!r}, format='png', "
+            "bbox_inches='tight')\n"
+            "_cavir_plt.close(_cavir_plt.gcf())\n"
+        )
     
     try:
-        file_path.write_text(content, encoding="utf-8")
-        
-        # Log the operation
-        _log_execution("write_workspace_file", {
-            "filename": final_filename,
-            "file_existed": file_existed,
-            "content_length": len(content)
-        }, workspace_dir)
-        
-        logger.info(f"{'Overwrote' if file_existed else 'Created'} file: {final_filename}")
-        
-        file_write_log = []
-        file_write_log.append(f"✅ File {'RENAMED' if file_existed else 'CREATED'}: {final_filename}")
-        file_write_log.append(f"📁 Workspace: {workspace_dir}")
-        file_write_log.append(f"📊 Size: {len(content)} characters")
-        
-        file_write_log = "\n".join(file_write_log)
-        
+        script_path.write_text(executable_source, encoding="utf-8")
+        logger.info(f"Created file: {script_path.name}")
+        log_lines = [
+            f"✅ File CREATED: {script_path.name}",
+            f"📁 Workspace: {workspace_dir}",
+            f"📊 Source size: {len(source)} characters",
+        ]
+        if plot_path is not None:
+            log_lines.append(f"🖼️ Plot: {plot_path.name}")
+        file_write_log = "\n".join(log_lines)
     except Exception as e:
-        error_msg = f"Failed to write file {final_filename}: {e}"
+        error_msg = f"Failed to write file {script_path.name}: {e}"
         logger.error(error_msg)
-        return {
-            "file_write_log": f"❌ {error_msg}",
-            "execution_result": ""
-        }
+        return _execution_failure(f"❌ {error_msg}"), None
     
-    # Hardcoded to run the python code with my specific environment
-    command = f"conda run -n research python {final_filename}"
-    workspace_dir = _get_workspace_dir(task_cache_dir)
-    # Get or create the sandbox for the workspace
-    sandbox_instance = _get_or_create_sandbox(workspace_dir, "subprocess", verbose, False)
-    # Execute the command
+    command = f"conda run -n research python {shlex.quote(script_path.name)}"
+    sandbox_instance = _get_or_create_sandbox(workspace_dir, verbose)
     execution_result = sandbox_instance.execute_terminal_command(command)
-    
-    # If resulting object is saved as a file in the workspace (chart or plot image)
-    # Load the file content -> convert to the base64 string -> return the base64 string in the execution result
-    
-    if os.path.isfile(execution_result.strip()) and execution_result.strip().endswith(".png"):
-        
-        # TODO: move temp file to the result directory
+    execution_error = _detect_execution_error(execution_result)
+
+    plot_bytes = None
+    if plot and not execution_error:
+        assert plot_path is not None
         try:
-            with open(execution_result.strip(), "rb") as f:
-                file_content = f.read()
-                base64_content = base64.b64encode(file_content).decode("utf-8")
-                execution_result = f"data:image/png;base64,{base64_content}"
-                execution_PIL = base64.b64decode(base64_content)
-                execution_PIL = Image.open(BytesIO(execution_PIL))
-                execution_PIL.save(f"{task_cache_dir}/{final_filename}_result.png")
-                file_write_log += f"\nExecution result is a file: {task_cache_dir}/{final_filename}_result.png"
-        except Exception as e:
-            execution_result = f"❌ Failed to read or encode the result file: {e}"
-            file_write_log += f"\n{execution_result}"
-        
-    return {
+            plot_bytes = plot_path.read_bytes()
+            if not plot_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("output is not a valid PNG file")
+        except Exception as exc:
+            execution_error = f"plot output missing or invalid: {exc}"
+
+    _log_execution(
+        tool_name,
+        {
+            "filename": script_path.name,
+            "path": str(script_path),
+            "content_length": len(source),
+            "plot_path": str(plot_path) if plot_path else "",
+            "execution_result": execution_result,
+            "execution_error": execution_error,
+        },
+        workspace_dir,
+    )
+
+    payload = {
         "file_write_log": file_write_log,
-        "execution_result": execution_result
+        "execution_result": execution_result,
+        "execution_error": execution_error,
+        "script_path": str(script_path),
     }
+    if plot_path is not None:
+        payload["plot_path"] = str(plot_path) if plot_bytes is not None else ""
+        payload["plot_filename"] = plot_path.name
+    return payload, plot_bytes
+
+
+@mcp.tool()
+async def math_compute(
+    filename: ScriptFilename,
+    content: MathSource,
+    task_cache_dir: TaskCacheDirectory = None,
+) -> Dict[str, str]:
+    """
+    Perform a self-contained multi-step calculation on numeric values already known.
+
+    USE for percentages, multi-step arithmetic, statistics, equations, or
+    geometry. DO NOT use for a single add, subtract, multiply, divide, or round;
+    do that step in your reasoning instead. Power, modulo, floor division,
+    library functions, and aggregations are valid here even when expressed in
+    one statement.
+
+    Put every source value directly in `content` as a literal and print the
+    final result. Never inspect the input image or acquire data with files,
+    input(), sys.argv, the network, or non-whitelisted imports. Returns the
+    script execution record; the printed stdout is the calculation result.
+
+    Example content:
+    `old=120; new=150; print((new-old)/old*100)`
+    """
+    contract_error = _validate_math_script(content)
+    if contract_error:
+        logger.info(f"Rejected math_compute script: {contract_error.splitlines()[0]}")
+        return _execution_failure(contract_error)
+
+    payload, _ = _write_and_execute(
+        "math_compute", filename, content, task_cache_dir, False
+    )
+    return payload
+
+
+@mcp.tool()
+async def visualize_data(
+    filename: ScriptFilename,
+    content: VisualizationSource,
+    task_cache_dir: TaskCacheDirectory = None,
+) -> mcp_types.CallToolResult:
+    """
+    Create one matplotlib plot from numeric values already known.
+
+    USE only when a visual representation helps compare patterns, inspect a
+    trend, plot coordinates, or sketch geometry. DO NOT use this tool to read
+    or analyze the input image; use image tools for that.
+
+    Put every plotted value directly in `content` as a literal. Import
+    `matplotlib.pyplot as plt` and create exactly one figure. Do not call
+    savefig(), close(), open(), input(), sys.argv, or any file/network/image
+    reader. The tool automatically saves `<script_stem>_plot.png` and returns
+    that PNG as an image.
+
+    Example content:
+    `import matplotlib.pyplot as plt; plt.plot([1,2,3], [4,7,5])`
+    """
+    contract_error = _validate_visualization_script(content)
+    if contract_error:
+        logger.info(f"Rejected visualize_data script: {contract_error.splitlines()[0]}")
+        payload = _execution_failure(contract_error)
+        return mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps(payload, ensure_ascii=False)
+                )
+            ]
+        )
+
+    payload, plot_bytes = _write_and_execute(
+        "visualize_data", filename, content, task_cache_dir, False, plot=True
+    )
+    content_blocks: list[mcp_types.ContentBlock] = [
+        mcp_types.TextContent(
+            type="text", text=json.dumps(payload, ensure_ascii=False)
+        )
+    ]
+    if plot_bytes is not None:
+        content_blocks.append(
+            mcp_types.ImageContent(
+                type="image",
+                data=base64.b64encode(plot_bytes).decode("ascii"),
+                mimeType="image/png",
+                _meta={
+                    "plot_path": payload["plot_path"],
+                    "plot_filename": payload["plot_filename"],
+                },
+            )
+        )
+    return mcp_types.CallToolResult(content=content_blocks)
 
 # --------------------------------------------------------------------------- #
 #  Entrypoint

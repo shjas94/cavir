@@ -20,12 +20,9 @@ class SubprocessInterpreter(BaseInterpreter):
 
     This class handles the execution of code in different scripting languages
     (currently Python and Bash) within a subprocess, capturing their
-    stdout and stderr streams, and allowing user checking before executing code
-    strings.
+    stdout and stderr streams.
 
     Args:
-        require_confirm (bool, optional): If True, prompt user before running
-            code strings for security. (default: :obj:`True`)
         print_stdout (bool, optional): If True, print the standard output of
             the executed code. (default: :obj:`False`)
         print_stderr (bool, optional): If True, print the standard error of the
@@ -63,13 +60,11 @@ class SubprocessInterpreter(BaseInterpreter):
 
     def __init__(
         self,
-        require_confirm: bool = True,
         print_stdout: bool = False,
         print_stderr: bool = True,
         execution_timeout: int = 60,
         workspace_dir: str | None = None,
     ) -> None:
-        self.require_confirm = require_confirm
         self.print_stdout = print_stdout
         self.print_stderr = print_stderr
         self.execution_timeout = execution_timeout
@@ -275,29 +270,10 @@ class SubprocessInterpreter(BaseInterpreter):
                 executed code.
 
         Raises:
-            InterpreterError: If the user declines to run the code or if the
-                code type is unsupported.
+            InterpreterError: If the code type is unsupported.
         """
         code_type = self._check_code_type(code_type)
 
-        # Print code for security checking
-        if self.require_confirm:
-            logger.info(
-                f"The following {code_type} code will run on your "
-                f"computer: {code}"
-            )
-            while True:
-                choice = input("Running code? [Y/n]:").lower().strip()
-                if choice in ["y", "yes", "ye", ""]:
-                    break
-                elif choice in ["no", "n"]:
-                    raise InterpreterError(
-                        "Execution halted: User opted not to run the code. "
-                        "This choice stops the current operation and any "
-                        "further code execution."
-                    )
-                else:
-                    print("Please enter 'y' or 'n'.")
 
         temp_file_path = None
         temp_dir = None

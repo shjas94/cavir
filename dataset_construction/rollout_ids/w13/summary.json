@@ -1,0 +1,45 @@
+{
+ "held_out_rows": {
+  "pool:full_r1_20261015": 1080,
+  "pool:full4b_20261024": 338,
+  "selection_following": 450
+ },
+ "held_out_pairs": 1524,
+ "datasets": {
+  "docvqa": {
+   "records": 35759,
+   "excluded": 170,
+   "same_image_other_question": 760
+  },
+  "infographics_vqa": {
+   "records": 19548,
+   "excluded": 170,
+   "same_image_other_question": 959
+  },
+  "chartqa_1": {
+   "records": 21853,
+   "excluded": 385,
+   "same_image_other_question": 250
+  },
+  "plotqa": {
+   "records": 292,
+   "excluded": 172,
+   "same_image_other_question": 0
+  },
+  "gqa_1": {
+   "records": 21094,
+   "excluded": 338,
+   "same_image_other_question": 4
+  },
+  "geometry3k": {
+   "records": 2078,
+   "excluded": 170,
+   "same_image_other_question": 0
+  },
+  "geomverse_cot": {
+   "records": 9295,
+   "excluded": 170,
+   "same_image_other_question": 0
+  }
+ }
+}
