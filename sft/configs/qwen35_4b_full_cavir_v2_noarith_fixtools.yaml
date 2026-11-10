@@ -1,0 +1,49 @@
+### model
+model_name_or_path: Qwen/Qwen3.5-4B
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+freeze_language_model: false
+enable_thinking: true
+
+### dataset
+dataset: cavir_coldstart_v2_noarith_fixtools
+template: qwen3_5
+cutoff_len: 65536
+preprocessing_num_workers: 8
+dataloader_num_workers: 1
+dataloader_drop_last: true
+dataloader_prefetch_factor: 1
+
+### output
+output_dir: saves/qwen35-4b-base/full/cavir_coldstart_v2_noarith_fixtools
+logging_steps: 2
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: tensorboard
+
+### train
+per_device_train_batch_size: 1  # LlamaFactory requires 1 for neat_packing with FlashAttention-2
+gradient_accumulation_steps: 8  # same effective batch as batch size 2 x accumulation 4
+enable_liger_kernel: true
+flash_attn: fa2
+packing: true
+neat_packing: true
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 900
+resume_from_checkpoint: null
+optim: adamw_torch_8bit
